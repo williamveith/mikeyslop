@@ -4,6 +4,7 @@ import math
 import time
 import argparse
 import requests
+import shutil
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
@@ -20,6 +21,12 @@ if not YOUTUBE_API_KEY:
     )
 
 YOUTUBE_BASE = "https://www.googleapis.com/youtube/v3"
+
+# YouTube free/search quota safety:
+# This script makes exactly 1 search.list call per keyword analyzed.
+# Keep the default below the 100/day free search-query bucket.
+FREE_SEARCH_CALL_LIMIT = 100
+HARD_SEARCH_CALL_SAFETY_CAP = 90
 
 DEFAULT_MODIFIERS = [
     "how to",
@@ -38,6 +45,7 @@ DEFAULT_MODIFIERS = [
 
 
 def youtube_get(endpoint, params):
+    params = dict(params)
     params["key"] = YOUTUBE_API_KEY
 
     response = requests.get(
@@ -273,108 +281,18 @@ def analyze_keyword(keyword, days_back, max_results, min_views):
 
 
 def write_csv(path, rows):
+    path = Path(path)
+
+    # Still create the file even when no rows pass filters.
+    # No fake field-name constants are used.
     if not rows:
+        path.write_text("", encoding="utf-8")
         return
 
-    with open(path, "w", newline="", encoding="utf-8") as f:
+    with path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
         writer.writeheader()
         writer.writerows(rows)
-
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="Local YouTube keyword opportunity scanner"
-    )
-
-    parser.add_argument(
-        "seeds",
-        nargs="+",
-        help="Seed topics, e.g. 'fitness' 'semiconductor' 'meal prep'",
-    )
-
-    parser.add_argument(
-        "--days",
-        type=int,
-        default=90,
-        help="Only analyze videos published within this many days",
-    )
-
-    parser.add_argument(
-        "--max-results",
-        type=int,
-        default=25,
-        help="Videos to analyze per keyword. Max 50.",
-    )
-
-    parser.add_argument(
-        "--min-views",
-        type=int,
-        default=1000,
-        help="Ignore videos below this view count",
-    )
-
-    parser.add_argument(
-        "--limit-keywords",
-        type=int,
-        default=100,
-        help="Maximum generated keywords to analyze",
-    )
-
-    args = parser.parse_args()
-
-    print("Generating keyword candidates...")
-    keywords = expand_keywords(args.seeds)
-    keywords = keywords[:args.limit_keywords]
-
-    print(f"Analyzing {len(keywords)} keywords...")
-
-    keyword_rows = []
-    video_rows = []
-
-    for i, keyword in enumerate(keywords, start=1):
-        print(f"[{i}/{len(keywords)}] {keyword}")
-
-        try:
-            keyword_row, videos = analyze_keyword(
-                keyword=keyword,
-                days_back=args.days,
-                max_results=min(args.max_results, 50),
-                min_views=args.min_views,
-            )
-
-            if keyword_row:
-                keyword_rows.append(keyword_row)
-                video_rows.extend(videos)
-
-        except requests.HTTPError as e:
-            print(f"HTTP error for keyword '{keyword}': {e}")
-        except Exception as e:
-            print(f"Error for keyword '{keyword}': {e}")
-
-        time.sleep(0.1)
-
-    keyword_rows.sort(
-        key=lambda row: row["opportunity_score"],
-        reverse=True,
-    )
-
-    write_csv("keyword_opportunities.csv", keyword_rows)
-    write_csv("video_evidence.csv", video_rows)
-
-    print("\nTop opportunities:")
-    for row in keyword_rows[:25]:
-        print(
-            f"{row['opportunity_score']:.3f} | "
-            f"{row['keyword']} | "
-            f"engagement={row['median_engagement_rate']:.2%} | "
-            f"views/day={row['median_views_per_day']:.1f} | "
-            f"competition={row['competition_score']:.2f}"
-        )
-
-    print("\nSaved:")
-    print("keyword_opportunities.csv")
-    print("video_evidence.csv")
 
 
 def get_seed_terms_from_env():
@@ -385,6 +303,24 @@ def get_seed_terms_from_env():
         for term in seed_terms.split(",")
         if term.strip()
     ]
+
+
+def prepare_output_dir():
+    """
+    Create ./output next to this script. If it already exists, clear it.
+    """
+    output_dir = Path(__file__).resolve().parent / "output"
+
+    if output_dir.exists():
+        for item in output_dir.iterdir():
+            if item.is_dir() and not item.is_symlink():
+                shutil.rmtree(item)
+            else:
+                item.unlink()
+    else:
+        output_dir.mkdir(parents=True)
+
+    return output_dir
 
 
 def main():
@@ -425,8 +361,18 @@ def main():
     parser.add_argument(
         "--limit-keywords",
         type=int,
-        default=100,
+        default=50,
         help="Maximum generated keywords to analyze",
+    )
+
+    parser.add_argument(
+        "--max-search-calls",
+        type=int,
+        default=HARD_SEARCH_CALL_SAFETY_CAP,
+        help=(
+            "Safety cap for YouTube search.list calls. "
+            "Hard capped at 90 to stay below the 100/day free search quota."
+        ),
     )
 
     args = parser.parse_args()
@@ -441,13 +387,42 @@ def main():
             "  SEED_TERMS=fitness for beginners,weight loss,meal prep"
         )
 
+    if args.max_results > 50:
+        raise RuntimeError("--max-results cannot exceed 50 because the YouTube API maxResults limit is 50.")
+
+    if args.limit_keywords < 1:
+        raise RuntimeError("--limit-keywords must be at least 1.")
+
+    if args.max_search_calls < 1:
+        raise RuntimeError("--max-search-calls must be at least 1.")
+
     print(f"Using seed terms: {', '.join(seeds)}")
-
     print("Generating keyword candidates...")
-    keywords = expand_keywords(seeds)
-    keywords = keywords[:args.limit_keywords]
 
-    print(f"Analyzing {len(keywords)} keywords...")
+    keywords = expand_keywords(seeds)
+
+    safe_keyword_limit = min(
+        args.limit_keywords,
+        args.max_search_calls,
+        HARD_SEARCH_CALL_SAFETY_CAP,
+    )
+
+    keywords = keywords[:safe_keyword_limit]
+
+    estimated_search_calls = len(keywords)
+    estimated_video_calls = len(keywords)
+
+    print("\nEstimated YouTube API calls:")
+    print(f"search.list calls: {estimated_search_calls} / {FREE_SEARCH_CALL_LIMIT} daily free search quota")
+    print(f"videos.list calls: up to {estimated_video_calls}")
+
+    if estimated_search_calls > HARD_SEARCH_CALL_SAFETY_CAP:
+        raise RuntimeError(
+            "Refusing to run: estimated search.list calls are too close to the "
+            "100/day free quota. Lower --limit-keywords or --max-search-calls."
+        )
+
+    print(f"\nAnalyzing {len(keywords)} keywords...")
 
     keyword_rows = []
     video_rows = []
@@ -459,7 +434,7 @@ def main():
             keyword_row, videos = analyze_keyword(
                 keyword=keyword,
                 days_back=args.days,
-                max_results=min(args.max_results, 50),
+                max_results=args.max_results,
                 min_views=args.min_views,
             )
 
@@ -469,6 +444,8 @@ def main():
 
         except requests.HTTPError as e:
             print(f"HTTP error for keyword '{keyword}': {e}")
+            if e.response is not None:
+                print(e.response.text[:1000])
         except Exception as e:
             print(f"Error for keyword '{keyword}': {e}")
 
@@ -479,22 +456,30 @@ def main():
         reverse=True,
     )
 
-    write_csv("keyword_opportunities.csv", keyword_rows)
-    write_csv("video_evidence.csv", video_rows)
+    output_dir = prepare_output_dir()
+    keyword_csv = output_dir / "keyword_opportunities.csv"
+    video_csv = output_dir / "video_evidence.csv"
+
+    write_csv(keyword_csv, keyword_rows)
+    write_csv(video_csv, video_rows)
 
     print("\nTop opportunities:")
-    for row in keyword_rows[:25]:
-        print(
-            f"{row['opportunity_score']:.3f} | "
-            f"{row['keyword']} | "
-            f"engagement={row['median_engagement_rate']:.2%} | "
-            f"views/day={row['median_views_per_day']:.1f} | "
-            f"competition={row['competition_score']:.2f}"
-        )
+    if keyword_rows:
+        for row in keyword_rows[:25]:
+            print(
+                f"{row['opportunity_score']:.3f} | "
+                f"{row['keyword']} | "
+                f"engagement={row['median_engagement_rate']:.2%} | "
+                f"views/day={row['median_views_per_day']:.1f} | "
+                f"competition={row['competition_score']:.2f}"
+            )
+    else:
+        print("No keywords passed the current filters.")
+        print("Try lowering --min-views or increasing --days.")
 
     print("\nSaved:")
-    print("keyword_opportunities.csv")
-    print("video_evidence.csv")
+    print(keyword_csv)
+    print(video_csv)
 
 
 if __name__ == "__main__":
